@@ -29,14 +29,20 @@ async function run() {
     const parcelCollection=parcelDb.collection('parcels');
 
     app.get('/parcels',async(req,res)=>{
-        
+         const query={};
+         const cursor=parcelCollection.find(query);
+         const result=await cursor.toArray();
+         res.send(result);   
     })
-    app.post('/parcels',async(req,res)=>{
-        const parcel=req.body;
-        const result=await parcelCollection.insertOne(parcel);
+    app.post('/parcels', async (req, res) => {
+    try {
+        const parcelItem = req.body;
+        const result = await parcelCollection.insertOne(parcelItem);
         res.send(result);
-
-    })
+    } catch (error) {
+        res.status(500).send({ error: 'Failed to insert parcel' });
+    }
+});
     
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
