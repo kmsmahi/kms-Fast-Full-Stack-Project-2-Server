@@ -23,39 +23,47 @@ const client = new MongoClient(uri, {
 
 async function run() {
   try {
-    // Connect the client to the server (optional starting in v4.7)
+    // Connect the client to the server
     await client.connect();
-    const parcelDb=client.db('parcelDb');
-    const parcelCollection=parcelDb.collection('parcels');
+    const parcelDb = client.db('parcelDb');
+    const parcelCollection = parcelDb.collection('parcels');
 
-    app.get('/parcels',async(req,res)=>{
-         const query={};
-         const cursor=parcelCollection.find(query);
-         const result=await cursor.toArray();
-         res.send(result);   
-    })
+    // --- GET Parcels (Supports filtering by email: /parcels?email=user@gmail.com) ---
+    app.get('/parcels', async (req, res) => {
+      try {
+        const email = req.query.email;
+        let query = {};
+        if (email) {
+          query = { senderEmail: email };
+        }
+        const cursor = parcelCollection.find(query);
+        const result = await cursor.toArray(); // 👈 Fixed missing await
+        res.send(result);   
+      } catch (error) {
+        console.error('Error fetching parcels:', error);
+        res.status(500).send({ error: 'Failed to fetch parcels' });
+      }
+    });
+
+    // --- POST Parcel ---
     app.post('/parcels', async (req, res) => {
-    try {
+      try {
         const parcelItem = req.body;
+        console.log('Received parcel payload:', parcelItem);
         const result = await parcelCollection.insertOne(parcelItem);
         res.send(result);
-    } catch (error) {
+      } catch (error) {
+        console.error('MongoDB Insert Error:', error);
         res.status(500).send({ error: 'Failed to insert parcel' });
-    }
-});
-    
+      }
+    });
+
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
     console.log("Successfully connected to MongoDB!");
 
-    // --- Define API Routes Here ---
-    // Example:
-    // const database = client.db("kms_fast_db");
-    // const parcelsCollection = database.collection("parcels");
-
-  } finally {
-    // Ensures that the client will close when you finish/error
-    // await client.close();
+  } catch (error) {
+    console.error('Failed to connect to MongoDB:', error);
   }
 }
 run().catch(console.dir);
