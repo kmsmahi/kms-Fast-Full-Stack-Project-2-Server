@@ -58,6 +58,21 @@ async function run() {
       }
     });
 
+    // delete parcel
+
+    app.delete('/parcels/:id',async(req,res)=>{
+      try{
+       const id=req.params.id;
+       const query={_id: new require('mongodb').ObjectId(id)};
+       const result=parcelCollection.deleteOne(query);
+       res.send(result);
+       }
+       catch (error) {
+        console.error('Delete Error:', error);
+        res.status(500).send({ error: 'Failed to delete parcel' });
+      }
+    })
+
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
     console.log("Successfully connected to MongoDB!");
