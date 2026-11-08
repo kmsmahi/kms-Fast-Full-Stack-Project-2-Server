@@ -5,7 +5,7 @@ const cors = require('cors');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const app = express();
 const port = process.env.PORT || 5000;
-
+const { ObjectId } = require("mongodb");
 // --- Middlewares ---
 app.use(cors({
   origin: ['http://localhost:5180', 'http://localhost:3000', 'http://localhost:5000'],
@@ -82,66 +82,208 @@ async function run() {
       }
     });
 
-    // --- CREATE STRIPE PAYMENT INTENT ---
-    app.post('/create-payment-intent', async (req, res) => {
-      try {
-        const { cost } = req.body;
-        console.log('Received cost from frontend:', cost);
+    // // --- CREATE STRIPE PAYMENT INTENT ---
+    // app.post('/create-payment-intent', async (req, res) => {
+    //   try {
+    //     const { cost } = req.body;
+    //     console.log('Received cost from frontend:', cost);
 
-        let parsedCost = parseFloat(cost) || 0;
+    //     let parsedCost = parseFloat(cost) || 0;
         
-        // Safeguard against any fractional decimal scaling shifts (e.g. if 13.90 was passed instead of 1390)
-        if (parsedCost > 0 && parsedCost < 50) {
-          parsedCost = parsedCost * 100;
+    //     // Safeguard against any fractional decimal scaling shifts (e.g. if 13.90 was passed instead of 1390)
+    //     if (parsedCost > 0 && parsedCost < 50) {
+    //       parsedCost = parsedCost * 100;
+    //     }
+
+    //     // Ensure the final calculated amount satisfies Stripe's minimum threshold (~৳50 equivalent)
+    //     const finalAmount = parsedCost < 50 ? 50 : parsedCost;
+    //     const amount = Math.round(finalAmount);
+
+    //     const paymentIntent = await stripe.paymentIntents.create({
+    //       amount: amount,
+    //       currency: 'bdt',
+    //     });
+
+    //     res.send({
+    //       clientSecret: paymentIntent.client_secret,
+    //     });
+    //   } catch (error) {
+    //    console.error('Stripe Intent Error Details:', error.message);
+    //     res.status(500).send({ error: error.message });
+    //   }
+    // });
+
+    // // --- UPDATE PARCEL PAYMENT STATUS AFTER SUCCESS ---
+    // app.patch('/parcels/payment/:id', async (req, res) => {
+    //   try {
+    //     const id = req.params.id;
+    //     const paymentInfo = req.body;
+    //     const { ObjectId } = require('mongodb');
+
+    //     let query;
+    //     try {
+    //       query = { _id: new ObjectId(id) };
+    //     } catch (e) {
+    //       query = { _id: id }; // Fallback if stored as string
+    //     }
+
+    //     const updateDoc = {
+    //       $set: {
+    //         paymentStatus: 'paid',
+    //         transactionId: paymentInfo.transactionId,
+    //         paidAt: new Date()
+    //       }
+    //     };
+
+    //     const result = await parcelCollection.updateOne(query, updateDoc);
+    //     res.send(result);
+    //   } catch (error) {
+    //     console.error('Payment Update Error:', error);
+    //     res.status(500).send({ error: 'Failed to update payment status' });
+    //   }
+    // });
+
+    // CREATE PAYMENT INTENT
+app.post("/create-payment-intent", async (req, res) => {
+    try {
+        const { parcelId } = req.body;
+
+        if (!ObjectId.isValid(parcelId)) {
+            return res.status(400).send({ error: "Invalid parcel ID" });
         }
 
-        // Ensure the final calculated amount satisfies Stripe's minimum threshold (~৳50 equivalent)
-        const finalAmount = parsedCost < 50 ? 50 : parsedCost;
-        const amount = Math.round(finalAmount);
+        const parcel = await parcelCollection.findOne({
+            _id: new ObjectId(parcelId)
+        });
+
+        if (!parcel) {
+            return res.status(404).send({ error: "Parcel not found" });
+        }
+
+        if (parcel.paymentStatus === "paid") {
+            return res.status(400).send({ error: "Parcel already paid" });
+        }
+
+        const cost = Number(parcel.cost);
+
+        if (!Number.isFinite(cost) || cost <= 0) {
+            return res.status(400).send({ error: "Invalid parcel amount" });
+        }
+
+        // BDT uses two decimal places
+        const amount = Math.round(cost * 100);
 
         const paymentIntent = await stripe.paymentIntents.create({
-          amount: amount,
-          currency: 'bdt',
+            amount,
+            currency: "bdt",
+            metadata: {
+                parcelId: parcel._id.toString()
+            }
         });
 
         res.send({
-          clientSecret: paymentIntent.client_secret,
+            clientSecret: paymentIntent.client_secret
         });
-      } catch (error) {
-       console.error('Stripe Intent Error Details:', error.message);
-        res.status(500).send({ error: error.message });
-      }
-    });
 
-    // --- UPDATE PARCEL PAYMENT STATUS AFTER SUCCESS ---
-    app.patch('/parcels/payment/:id', async (req, res) => {
-      try {
-        const id = req.params.id;
-        const paymentInfo = req.body;
-        const { ObjectId } = require('mongodb');
+    } catch (error) {
+        console.error("Stripe Intent Error:", error.message);
 
-        let query;
-        try {
-          query = { _id: new ObjectId(id) };
-        } catch (e) {
-          query = { _id: id }; // Fallback if stored as string
+        res.status(500).send({
+            error: error.message
+        });
+    }
+});
+
+
+// VERIFY PAYMENT AND UPDATE PARCEL
+app.patch("/parcels/payment/:id", async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { transactionId } = req.body;
+
+        if (!ObjectId.isValid(id) || !transactionId) {
+            return res.status(400).send({
+                error: "Invalid payment information"
+            });
         }
 
-        const updateDoc = {
-          $set: {
-            paymentStatus: 'paid',
-            transactionId: paymentInfo.transactionId,
-            paidAt: new Date()
-          }
-        };
+        // Verify directly with Stripe
+        const paymentIntent = await stripe.paymentIntents.retrieve(
+            transactionId
+        );
 
-        const result = await parcelCollection.updateOne(query, updateDoc);
-        res.send(result);
-      } catch (error) {
-        console.error('Payment Update Error:', error);
-        res.status(500).send({ error: 'Failed to update payment status' });
-      }
-    });
+        if (paymentIntent.status !== "succeeded") {
+            return res.status(400).send({
+                error: "Payment has not been completed"
+            });
+        }
+
+        // Verify that this payment belongs to this parcel
+        if (paymentIntent.metadata.parcelId !== id) {
+            return res.status(400).send({
+                error: "Payment does not match this parcel"
+            });
+        }
+
+        const parcel = await parcelCollection.findOne({
+            _id: new ObjectId(id)
+        });
+
+        if (!parcel) {
+            return res.status(404).send({
+                error: "Parcel not found"
+            });
+        }
+
+        if (parcel.paymentStatus === "paid") {
+            return res.status(409).send({
+                error: "Parcel already paid"
+            });
+        }
+
+        // Verify the actual charged amount
+        const expectedAmount = Math.round(Number(parcel.cost) * 100);
+
+        if (paymentIntent.amount !== expectedAmount ||
+            paymentIntent.currency !== "bdt") {
+            return res.status(400).send({
+                error: "Payment amount mismatch"
+            });
+        }
+
+        const result = await parcelCollection.updateOne(
+            {
+                _id: new ObjectId(id),
+                paymentStatus: { $ne: "paid" }
+            },
+            {
+                $set: {
+                    paymentStatus: "paid",
+                    transactionId: paymentIntent.id,
+                    paidAt: new Date()
+                }
+            }
+        );
+
+        if (result.modifiedCount === 0) {
+            return res.status(409).send({
+                error: "Payment status could not be updated"
+            });
+        }
+
+        res.send({
+            success: true,
+            message: "Payment verified successfully"
+        });
+
+    } catch (error) {
+        console.error("Payment Verification Error:", error.message);
+
+        res.status(500).send({
+            error: "Payment verification failed"
+        });
+    }
+});
 
 
     
