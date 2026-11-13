@@ -44,7 +44,6 @@ const verifyToken = async (req, res, next) => {
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      // Fallback: If token header is missing, check if query email matches or allow unauthenticated read for safety
       req.decoded = {};
       return next();
     }
@@ -95,9 +94,11 @@ async function run() {
     const parcelDb = client.db('parcelDb');
     const parcelCollection = parcelDb.collection('parcels');
     const paymentCollection = parcelDb.collection('payments');
+    const userCollection = parcelDb.collection('users');
 
-    // Ensure transaction IDs cannot be recorded twice
+    // Ensure unique indexes
     await paymentCollection.createIndex({ transactionId: 1 }, { unique: true, sparse: true });
+    await userCollection.createIndex({ email: 1 }, { unique: true });
 
     await client.db("admin").command({ ping: 1 });
     console.log("Successfully connected to MongoDB!");
@@ -106,6 +107,63 @@ async function run() {
     app.get('/', (req, res) => {
       res.send('KMS-FAST Server is running smoothly...');
     });
+
+    // ==========================================
+    // USERS & ROLES MANAGEMENT APIS
+    // ==========================================
+
+    // --- 1. Save or Update User on Login/Signup ---
+    app.post('/users', async (req, res) => {
+      try {
+        const userInfo = req.body;
+        const email = userInfo.email;
+
+        if (!email) {
+          return res.status(400).send({ error: "User email is required." });
+        }
+
+        const existingUser = await userCollection.findOne({ email });
+
+        if (existingUser) {
+          return res.send({ message: "User already exists in database.", insertedId: null });
+        }
+
+        const newUser = {
+          name: userInfo.name || "Valued User",
+          email: email,
+          image: userInfo.image || "",
+          role: "user",
+          createdAt: new Date()
+        };
+
+        const result = await userCollection.insertOne(newUser);
+        res.status(201).send(result);
+      } catch (error) {
+        console.error("Error creating user:", error);
+        res.status(500).send({ error: "Failed to save user profile." });
+      }
+    });
+
+    // --- 2. Get User Role by Email ---
+    app.get('/users/role/:email', verifyToken, async (req, res) => {
+      try {
+        const email = req.params.email;
+
+        if (req.decoded?.email && req.decoded.email.toLowerCase() !== email.toLowerCase()) {
+          return res.status(403).send({ error: true, message: "Forbidden access: Email mismatch." });
+        }
+
+        const user = await userCollection.findOne({ email });
+        res.send({ role: user?.role || 'user' });
+      } catch (error) {
+        console.error("Error fetching user role:", error);
+        res.status(500).send({ error: "Failed to fetch role." });
+      }
+    });
+
+    // ==========================================
+    // PARCELS & PAYMENTS APIS
+    // ==========================================
 
     // --- GET Parcels ---
     app.get('/parcels', verifyToken, async (req, res) => {
@@ -150,6 +208,35 @@ async function run() {
       }
     });
 
+    // --- DELETE Parcel by ID ---
+    // app.delete('/parcels/:id', verifyToken, async (req, res) => {
+    //   try {
+    //     const { id } = req.params;
+
+    //     let query;
+    //     try {
+    //       query = { _id: new ObjectId(id) };
+    //     } catch (e) {
+    //       query = { _id: id };
+    //     }
+
+    //     const parcel = await parcelCollection.findOne(query);
+
+    //     if (!parcel) {
+    //       return res.status(404).send({ error: true, message: "Parcel not found." });
+    //     }
+
+    //     if (parcel.paymentStatus === "paid") {
+    //       return res.status(400).send({ error: true, message: "Paid parcels cannot be deleted." });
+    //     }
+
+    //     const result = await parcelCollection.deleteOne(query);
+    //     res.send({ success: true, message: "Parcel deleted successfully.", result });
+    //   } catch (error) {
+    //     console.error('Delete Error:', error);
+    //     res.status(500).send({ error: 'Failed to delete parcel' });
+    //   }
+    // });
     // --- DELETE Parcel by ID ---
     app.delete('/parcels/:id', verifyToken, async (req, res) => {
       try {
@@ -221,7 +308,7 @@ async function run() {
       }
     });
 
-    // --- VERIFY PAYMENT AND UPDATE PARCEL ---
+    // --- VERIFY STRIPE PAYMENT AND UPDATE PARCEL ---
     app.patch('/parcels/payment/:id', verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
@@ -270,6 +357,43 @@ async function run() {
       } catch (error) {
         console.error('Payment Update Error:', error.message);
         res.status(500).send({ error: 'Failed to update payment status' });
+      }
+    });
+
+    // --- PROCESS MOBILE BANKING PAYMENT (bKash / Nagad) ---
+    app.patch('/parcels/mobile-payment/:id', verifyToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { transactionId } = req.body;
+
+        if (!isValidObjectId(id) || !transactionId) {
+          return res.status(400).send({ error: "Invalid payment information." });
+        }
+
+        const parcel = await findParcelById(parcelCollection, id);
+        if (!parcel) {
+          return res.status(404).send({ error: "Parcel not found." });
+        }
+
+        if (parcel.paymentStatus === "paid") {
+          return res.send({ success: true, message: "Parcel already paid." });
+        }
+
+        const result = await parcelCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              paymentStatus: 'paid',
+              transactionId: transactionId,
+              paidAt: new Date()
+            }
+          }
+        );
+
+        res.send({ success: true, message: "Mobile payment verified successfully.", modifiedCount: result.modifiedCount });
+      } catch (error) {
+        console.error('Mobile Payment Update Error:', error.message);
+        res.status(500).send({ error: 'Failed to update mobile payment status' });
       }
     });
 
