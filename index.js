@@ -8,7 +8,7 @@ const port = process.env.PORT || 5000;
 const { ObjectId } = require("mongodb");
 // --- Middlewares ---
 app.use(cors({
-  origin: ['http://localhost:5180', 'http://localhost:3000', 'http://localhost:5000'],
+  origin: ['http://localhost:5174', 'http://localhost:3000', 'http://localhost:5000'],
   credentials: true
 }));
 app.use(express.json());
@@ -30,7 +30,7 @@ async function run() {
     await client.connect();
     const parcelDb = client.db('parcelDb');
     const parcelCollection = parcelDb.collection('parcels');
-
+    const paymentCollection=parcelDb.collection('payments');
     // --- GET Parcels (Supports filtering by email: /parcels?email=user@gmail.com) ---
     app.get('/parcels', async (req, res) => {
       try {
@@ -284,6 +284,64 @@ app.patch("/parcels/payment/:id", async (req, res) => {
         });
     }
 });
+
+    //  Record Payment & Update Parcel on Successful Checkout / Mobile Payment ---
+    app.post('/payments', async (req, res) => {
+      try {
+        const paymentData = req.body;
+        // paymentData should include: parcelId, parcelName, customerEmail, amount, transactionId, method, paidAt
+
+        const newPayment = {
+          ...paymentData,
+          amount: parseFloat(paymentData.amount) || 0,
+          paidAt: new Date()
+        };
+
+        const insertResult = await paymentCollection.insertOne(newPayment);
+
+        // Also mark parcel as paid
+        let query;
+        try {
+          query = { _id: new ObjectId(paymentData.parcelId) };
+        } catch (e) {
+          query = { _id: paymentData.parcelId };
+        }
+
+        const updateDoc = {
+          $set: {
+            paymentStatus: 'paid',
+            transactionId: paymentData.transactionId,
+            paidAt: new Date()
+          }
+        };
+
+        await parcelCollection.updateOne(query, updateDoc);
+
+        res.send({ success: true, insertResult });
+      } catch (error) {
+        console.error('Payment Recording Error:', error);
+        res.status(500).send({ error: 'Failed to record payment transaction' });
+      }
+    });
+
+
+    app.get('/payments', async (req, res) => {
+      try {
+        const email = req.query.email;
+        let query = {};
+        if (email) {
+          query = { customerEmail: email };
+        }
+        const options = { sort: { paidAt: -1 } }; // Newest transactions first
+        const cursor = paymentCollection.find(query, options);
+        const result = await cursor.toArray();
+        res.send(result);
+      } catch (error) {
+        console.error('Error fetching payment history:', error);
+        res.status(500).send({ error: 'Failed to fetch payment history' });
+      }
+    });
+
 
 
     
