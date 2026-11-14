@@ -95,10 +95,12 @@ async function run() {
     const parcelCollection = parcelDb.collection('parcels');
     const paymentCollection = parcelDb.collection('payments');
     const userCollection = parcelDb.collection('users');
+    const riderCollection = parcelDb.collection('riders');
 
     // Ensure unique indexes
     await paymentCollection.createIndex({ transactionId: 1 }, { unique: true, sparse: true });
     await userCollection.createIndex({ email: 1 }, { unique: true });
+    await riderCollection.createIndex({ email: 1 }, { unique: true });
 
     await client.db("admin").command({ ping: 1 });
     console.log("Successfully connected to MongoDB!");
@@ -112,7 +114,6 @@ async function run() {
     // USERS & ROLES MANAGEMENT APIS
     // ==========================================
 
-    // --- 1. Save or Update User on Login/Signup ---
     app.post('/users', async (req, res) => {
       try {
         const userInfo = req.body;
@@ -144,7 +145,6 @@ async function run() {
       }
     });
 
-    // --- 2. Get User Role by Email ---
     app.get('/users/role/:email', verifyToken, async (req, res) => {
       try {
         const email = req.params.email;
@@ -165,7 +165,6 @@ async function run() {
     // PARCELS & PAYMENTS APIS
     // ==========================================
 
-    // --- GET Parcels ---
     app.get('/parcels', verifyToken, async (req, res) => {
       try {
         const email = req.query.email;
@@ -185,12 +184,9 @@ async function run() {
       }
     });
 
-    // --- POST Parcel ---
     app.post('/parcels', verifyToken, async (req, res) => {
       try {
         const parcelItem = req.body;
-        console.log('Received parcel payload:', parcelItem);
-
         const newParcel = {
           ...parcelItem,
           senderEmail: parcelItem.senderEmail || (req.decoded ? req.decoded.email : ''),
@@ -208,36 +204,6 @@ async function run() {
       }
     });
 
-    // --- DELETE Parcel by ID ---
-    // app.delete('/parcels/:id', verifyToken, async (req, res) => {
-    //   try {
-    //     const { id } = req.params;
-
-    //     let query;
-    //     try {
-    //       query = { _id: new ObjectId(id) };
-    //     } catch (e) {
-    //       query = { _id: id };
-    //     }
-
-    //     const parcel = await parcelCollection.findOne(query);
-
-    //     if (!parcel) {
-    //       return res.status(404).send({ error: true, message: "Parcel not found." });
-    //     }
-
-    //     if (parcel.paymentStatus === "paid") {
-    //       return res.status(400).send({ error: true, message: "Paid parcels cannot be deleted." });
-    //     }
-
-    //     const result = await parcelCollection.deleteOne(query);
-    //     res.send({ success: true, message: "Parcel deleted successfully.", result });
-    //   } catch (error) {
-    //     console.error('Delete Error:', error);
-    //     res.status(500).send({ error: 'Failed to delete parcel' });
-    //   }
-    // });
-    // --- DELETE Parcel by ID ---
     app.delete('/parcels/:id', verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
@@ -267,7 +233,6 @@ async function run() {
       }
     });
 
-    // --- CREATE STRIPE PAYMENT INTENT ---
     app.post('/create-payment-intent', verifyToken, async (req, res) => {
       try {
         const { parcelId } = req.body;
@@ -308,7 +273,6 @@ async function run() {
       }
     });
 
-    // --- VERIFY STRIPE PAYMENT AND UPDATE PARCEL ---
     app.patch('/parcels/payment/:id', verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
@@ -360,7 +324,6 @@ async function run() {
       }
     });
 
-    // --- PROCESS MOBILE BANKING PAYMENT (bKash / Nagad) ---
     app.patch('/parcels/mobile-payment/:id', verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
@@ -397,20 +360,17 @@ async function run() {
       }
     });
 
-    // --- RECORD VERIFIED PAYMENT ---
     app.post('/payments', verifyToken, async (req, res) => {
       try {
         const paymentData = req.body;
-
         const newPayment = {
           ...paymentData,
           amount: parseFloat(paymentData.amount) || 0,
           paidAt: new Date()
         };
 
-        let insertResult;
         try {
-          insertResult = await paymentCollection.insertOne(newPayment);
+          await paymentCollection.insertOne(newPayment);
         } catch (insertError) {
           if (insertError.code === 11000) {
             return res.send({ success: true, message: "Payment already recorded." });
@@ -425,24 +385,21 @@ async function run() {
           query = { _id: paymentData.parcelId };
         }
 
-        const updateDoc = {
+        await parcelCollection.updateOne(query, {
           $set: {
             paymentStatus: 'paid',
             transactionId: paymentData.transactionId,
             paidAt: new Date()
           }
-        };
+        });
 
-        await parcelCollection.updateOne(query, updateDoc);
-
-        res.status(201).send({ success: true, message: "Payment recorded successfully.", insertResult });
+        res.status(201).send({ success: true, message: "Payment recorded successfully." });
       } catch (error) {
         console.error('Payment Recording Error:', error);
         res.status(500).send({ error: 'Failed to record payment transaction' });
       }
     });
 
-    // --- GET PAYMENT HISTORY ---
     app.get('/payments', verifyToken, async (req, res) => {
       try {
         const email = req.query.email;
@@ -454,13 +411,86 @@ async function run() {
           query = { customerEmail: req.decoded.email };
         }
 
-        const options = { sort: { paidAt: -1 } };
-        const cursor = paymentCollection.find(query, options);
-        const result = await cursor.toArray();
+        const result = await paymentCollection.find(query, { sort: { paidAt: -1 } }).toArray();
         res.send(result);
       } catch (error) {
         console.error('Error fetching payment history:', error);
         res.status(500).send({ error: 'Failed to fetch payment history' });
+      }
+    });
+
+    // ==========================================
+    // RIDERS APIS
+    // ==========================================
+
+    app.post('/riders', verifyToken, async (req, res) => {
+      try {
+        const riderData = req.body;
+        const email = riderData.email;
+
+        if (!email) {
+          return res.status(400).send({ error: "Rider email is required." });
+        }
+
+        const existingRider = await riderCollection.findOne({ email });
+        if (existingRider) {
+          return res.status(400).send({ error: "An application with this email already exists." });
+        }
+
+        const newRider = {
+          ...riderData,
+          status: 'pending',
+          appliedAt: new Date()
+        };
+
+        const result = await riderCollection.insertOne(newRider);
+        res.status(201).send({ success: true, message: "Rider application submitted successfully.", insertedId: result.insertedId });
+      } catch (error) {
+        console.error("Error submitting rider application:", error);
+        res.status(500).send({ error: "Failed to submit rider application." });
+      }
+    });
+
+    app.get('/riders', verifyToken, async (req, res) => {
+      try {
+        const status = req.query.status;
+        let query = {};
+        if (status) {
+          query.status = status;
+        }
+        const result = await riderCollection.find(query).sort({ appliedAt: -1 }).toArray();
+        res.send(result);
+      } catch (error) {
+        console.error("Error fetching riders:", error);
+        res.status(500).send({ error: "Failed to fetch riders list." });
+      }
+    });
+
+    app.patch('/riders/status/:id', verifyToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { status } = req.body;
+
+        if (!isValidObjectId(id)) {
+          return res.status(400).send({ error: "Invalid rider ID." });
+        }
+
+        const result = await riderCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status: status } }
+        );
+
+        if (status === 'approved') {
+          const rider = await riderCollection.findOne({ _id: new ObjectId(id) });
+          if (rider?.email) {
+            await userCollection.updateOne({ email: rider.email }, { $set: { role: 'rider' } });
+          }
+        }
+
+        res.send({ success: true, message: `Rider status updated to ${status}.`, result });
+      } catch (error) {
+        console.error("Error updating rider status:", error);
+        res.status(500).send({ error: "Failed to update rider status." });
       }
     });
 
