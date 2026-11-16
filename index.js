@@ -3,24 +3,26 @@ const express = require('express');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const cors = require('cors');
 const Stripe = require('stripe');
-const admin = require('firebase-admin');
+
+// --- Modular Firebase Admin Imports ---
+const { initializeApp, cert, getApps } = require('firebase-admin/app');
+const { getAuth } = require('firebase-admin/auth');
+const serviceAccount = require('./serviceAccountKey.json');
 
 // --- Initialization ---
 const app = express();
 const port = process.env.PORT || 5000;
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
-// --- Firebase Admin Setup (Using local serviceAccountKey.json) ---
-const serviceAccount = require('./serviceAccountKey.json');
-
+// --- Firebase Admin Setup ---
 try {
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-  });
-} catch (error) {
-  if (!/already exists/u.test(error.message)) {
-    console.error('Firebase Admin Initialization Error:', error.stack);
+  if (!getApps().length) {
+    initializeApp({
+      credential: cert(serviceAccount)
+    });
   }
+} catch (error) {
+  console.error('Firebase Admin Initialization Error:', error.stack);
 }
 
 // --- Middlewares ---
@@ -38,7 +40,7 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// --- Flexible Firebase Token Verification Middleware ---
+// --- Flexible Firebase Token Verification Middleware (Matches your existing system) ---
 const verifyToken = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
@@ -54,7 +56,7 @@ const verifyToken = async (req, res, next) => {
       return next();
     }
 
-    const decodedToken = await admin.auth().verifyIdToken(token);
+    const decodedToken = await getAuth().verifyIdToken(token);
     req.decoded = decodedToken;
     next();
   } catch (error) {
@@ -114,50 +116,129 @@ async function run() {
     // USERS & ROLES MANAGEMENT APIS
     // ==========================================
 
+    // --- 1. Save or Update User on Login/Signup (Preserves Dynamic Roles) ---
     app.post('/users', async (req, res) => {
       try {
         const userInfo = req.body;
-        const email = userInfo.email;
+        const email = userInfo.email?.toLowerCase().trim();
 
         if (!email) {
           return res.status(400).send({ error: "User email is required." });
         }
 
-        const existingUser = await userCollection.findOne({ email });
+        const isSuperAdmin = email === "salauddinmahi2002@gmail.com";
 
-        if (existingUser) {
-          return res.send({ message: "User already exists in database.", insertedId: null });
-        }
-
-        const newUser = {
-          name: userInfo.name || "Valued User",
-          email: email,
-          image: userInfo.image || "",
-          role: "user",
-          createdAt: new Date()
+        const updateDoc = {
+          $set: {
+            name: userInfo.name || "Valued User",
+            image: userInfo.image || "",
+            ...(isSuperAdmin && { role: "admin" })
+          },
+          $setOnInsert: {
+            email: email,
+            ...(!isSuperAdmin && { role: "user" }),
+            createdAt: new Date()
+          }
         };
 
-        const result = await userCollection.insertOne(newUser);
-        res.status(201).send(result);
+        const result = await userCollection.findOneAndUpdate(
+          { email },
+          updateDoc,
+          { upsert: true, returnDocument: 'after' }
+        );
+
+        res.status(200).send({ success: true, message: "User synchronized successfully.", user: result });
       } catch (error) {
-        console.error("Error creating user:", error);
+        console.error("Error creating/updating user:", error);
         res.status(500).send({ error: "Failed to save user profile." });
       }
     });
 
+    // --- 2. Get User Role by Email (Never blocks or throws 401/403) ---
     app.get('/users/role/:email', verifyToken, async (req, res) => {
       try {
-        const email = req.params.email;
+        const email = req.params.email?.toLowerCase().trim();
 
-        if (req.decoded?.email && req.decoded.email.toLowerCase() !== email.toLowerCase()) {
-          return res.status(403).send({ error: true, message: "Forbidden access: Email mismatch." });
+        if (!email) {
+          return res.send({ role: 'user' });
+        }
+
+        if (email === "salauddinmahi2002@gmail.com") {
+          return res.send({ role: "admin" });
         }
 
         const user = await userCollection.findOne({ email });
         res.send({ role: user?.role || 'user' });
       } catch (error) {
         console.error("Error fetching user role:", error);
-        res.status(500).send({ error: "Failed to fetch role." });
+        res.send({ role: 'user' });
+      }
+    });
+
+    // --- 3. GET All Users (Non-blocking with flexible token support) ---
+    app.get('/users', verifyToken, async (req, res) => {
+      try {
+        const requesterEmail = req.decoded?.email?.toLowerCase().trim();
+
+        if (requesterEmail && requesterEmail !== "salauddinmahi2002@gmail.com") {
+          const requester = await userCollection.findOne({ email: requesterEmail });
+          if (requester?.role !== 'admin') {
+            return res.status(403).send({ error: true, message: "Forbidden access: Admin only." });
+          }
+        }
+
+        const result = await userCollection.find().sort({ createdAt: -1 }).toArray();
+        res.send(result);
+      } catch (error) {
+        console.error("Error fetching users list:", error);
+        res.status(500).send({ error: "Failed to fetch users." });
+      }
+    });
+
+    // --- 4. UPDATE User Role (Promote / Demote Admin) ---
+    app.patch('/users/admin/:id', verifyToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { role } = req.body;
+        const requesterEmail = req.decoded?.email?.toLowerCase().trim();
+
+        if (requesterEmail && requesterEmail !== "salauddinmahi2002@gmail.com") {
+          const requester = await userCollection.findOne({ email: requesterEmail });
+          if (requester?.role !== 'admin') {
+            return res.status(403).send({ error: "Forbidden access: Admin only." });
+          }
+        }
+
+        if (!isValidObjectId(id)) {
+          return res.status(400).send({ error: "Invalid user ID." });
+        }
+
+        if (!['admin', 'user', 'rider'].includes(role)) {
+          return res.status(400).send({ error: "Invalid role specified." });
+        }
+
+        const targetUser = await userCollection.findOne({ _id: new ObjectId(id) });
+        if (!targetUser) {
+          return res.status(404).send({ error: "User not found." });
+        }
+
+        if (targetUser.email?.toLowerCase().trim() === "salauddinmahi2002@gmail.com" && role !== 'admin') {
+          return res.status(403).send({ error: "Cannot remove admin role from Super Admin." });
+        }
+
+        const result = await userCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { role: role } }
+        );
+
+        res.send({
+          success: true,
+          message: `User role successfully updated to ${role}.`,
+          modifiedCount: result.modifiedCount
+        });
+      } catch (error) {
+        console.error("Error updating user role:", error);
+        res.status(500).send({ error: "Failed to update user role." });
       }
     });
 
@@ -165,6 +246,7 @@ async function run() {
     // PARCELS & PAYMENTS APIS
     // ==========================================
 
+    // --- GET User Parcels (Filtered by senderEmail) ---
     app.get('/parcels', verifyToken, async (req, res) => {
       try {
         const email = req.query.email;
@@ -184,6 +266,75 @@ async function run() {
       }
     });
 
+    // --- NEW: GET ALL Parcels for Admin Dashboard ---
+    app.get('/parcels/admin/all', verifyToken, async (req, res) => {
+      try {
+        const requesterEmail = req.decoded?.email?.toLowerCase().trim();
+
+        if (requesterEmail && requesterEmail !== "salauddinmahi2002@gmail.com") {
+          const requester = await userCollection.findOne({ email: requesterEmail });
+          if (requester?.role !== 'admin') {
+            return res.status(403).send({ error: true, message: "Forbidden access: Admin only." });
+          }
+        }
+
+        const result = await parcelCollection
+          .find({})
+          .sort({ createdAt: -1, creation_date: -1 })
+          .toArray();
+
+        res.send(result);
+      } catch (error) {
+        console.error('Error fetching all parcels for admin:', error);
+        res.status(500).send({ error: 'Failed to fetch all parcels' });
+      }
+    });
+
+    // --- NEW: UPDATE Parcel Delivery Status (Admin Action) ---
+    app.patch('/parcels/status/:id', verifyToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { status } = req.body;
+        const requesterEmail = req.decoded?.email?.toLowerCase().trim();
+
+        if (requesterEmail && requesterEmail !== "salauddinmahi2002@gmail.com") {
+          const requester = await userCollection.findOne({ email: requesterEmail });
+          if (requester?.role !== 'admin') {
+            return res.status(403).send({ error: "Forbidden access: Admin only." });
+          }
+        }
+
+        if (!isValidObjectId(id)) {
+          return res.status(400).send({ error: "Invalid parcel ID." });
+        }
+
+        const allowedStatuses = ['pending', 'picked-up', 'in-transit', 'delivered', 'cancelled'];
+        if (!allowedStatuses.includes(status)) {
+          return res.status(400).send({ error: "Invalid parcel status." });
+        }
+
+        const result = await parcelCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              status: status,
+              updatedAt: new Date()
+            }
+          }
+        );
+
+        res.send({
+          success: true,
+          message: `Parcel status updated to ${status}.`,
+          modifiedCount: result.modifiedCount
+        });
+      } catch (error) {
+        console.error('Error updating parcel status:', error);
+        res.status(500).send({ error: 'Failed to update parcel status' });
+      }
+    });
+
+    // --- POST Parcel ---
     app.post('/parcels', verifyToken, async (req, res) => {
       try {
         const parcelItem = req.body;
@@ -191,6 +342,7 @@ async function run() {
           ...parcelItem,
           senderEmail: parcelItem.senderEmail || (req.decoded ? req.decoded.email : ''),
           paymentStatus: parcelItem.paymentStatus || "unpaid",
+          status: parcelItem.status || "pending",
           createdAt: new Date()
         };
 
@@ -204,6 +356,7 @@ async function run() {
       }
     });
 
+    // --- DELETE Parcel by ID ---
     app.delete('/parcels/:id', verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
@@ -233,6 +386,7 @@ async function run() {
       }
     });
 
+    // --- CREATE STRIPE PAYMENT INTENT ---
     app.post('/create-payment-intent', verifyToken, async (req, res) => {
       try {
         const { parcelId } = req.body;
@@ -273,6 +427,7 @@ async function run() {
       }
     });
 
+    // --- VERIFY STRIPE PAYMENT AND UPDATE PARCEL ---
     app.patch('/parcels/payment/:id', verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
@@ -306,7 +461,7 @@ async function run() {
           return res.status(400).send({ error: "Payment amount mismatch." });
         }
 
-        const result = await parcelCollection.updateOne(
+        await parcelCollection.updateOne(
           { _id: new ObjectId(id) },
           {
             $set: {
@@ -324,6 +479,7 @@ async function run() {
       }
     });
 
+    // --- PROCESS MOBILE BANKING PAYMENT (bKash / Nagad) ---
     app.patch('/parcels/mobile-payment/:id', verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
@@ -360,6 +516,7 @@ async function run() {
       }
     });
 
+    // --- RECORD VERIFIED PAYMENT ---
     app.post('/payments', verifyToken, async (req, res) => {
       try {
         const paymentData = req.body;
@@ -400,6 +557,7 @@ async function run() {
       }
     });
 
+    // --- GET PAYMENT HISTORY ---
     app.get('/payments', verifyToken, async (req, res) => {
       try {
         const email = req.query.email;
@@ -423,6 +581,7 @@ async function run() {
     // RIDERS APIS
     // ==========================================
 
+    // --- 1. POST Rider Application ---
     app.post('/riders', verifyToken, async (req, res) => {
       try {
         const riderData = req.body;
@@ -451,6 +610,7 @@ async function run() {
       }
     });
 
+    // --- 2. GET All Riders ---
     app.get('/riders', verifyToken, async (req, res) => {
       try {
         const status = req.query.status;
@@ -466,6 +626,7 @@ async function run() {
       }
     });
 
+    // --- 3. UPDATE Rider Status (Approve / Reject) ---
     app.patch('/riders/status/:id', verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
