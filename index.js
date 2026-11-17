@@ -13,6 +13,7 @@ const serviceAccount = require('./serviceAccountKey.json');
 const app = express();
 const port = process.env.PORT || 5000;
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+const SUPER_ADMIN_EMAIL = "salauddinmahi2002@gmail.com";
 
 // --- Firebase Admin Setup ---
 try {
@@ -40,20 +41,18 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// --- Flexible Firebase Token Verification Middleware (Matches your existing system) ---
+// --- Strict Firebase Token Verification Middleware ---
 const verifyToken = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      req.decoded = {};
-      return next();
+      return res.status(404).send({ error: true, message: "Not Found" });
     }
 
     const token = authHeader.split(" ")[1];
-    if (!token) {
-      req.decoded = {};
-      return next();
+    if (!token || token === "null" || token === "undefined") {
+      return res.status(404).send({ error: true, message: "Not Found" });
     }
 
     const decodedToken = await getAuth().verifyIdToken(token);
@@ -61,8 +60,7 @@ const verifyToken = async (req, res, next) => {
     next();
   } catch (error) {
     console.error("Firebase Token Verification Error:", error.message);
-    req.decoded = {};
-    next();
+    return res.status(404).send({ error: true, message: "Not Found" });
   }
 };
 
@@ -107,6 +105,30 @@ async function run() {
     await client.db("admin").command({ ping: 1 });
     console.log("Successfully connected to MongoDB!");
 
+    // --- Admin Verification Middleware (Inside run() so userCollection is in scope) ---
+    const verifyAdmin = async (req, res, next) => {
+      try {
+        const email = req.decoded?.email?.toLowerCase().trim();
+        if (!email) {
+          return res.status(404).send({ error: true, message: "Not Found" });
+        }
+
+        if (email === SUPER_ADMIN_EMAIL) {
+          return next();
+        }
+
+        const user = await userCollection.findOne({ email });
+        if (user?.role !== 'admin') {
+          return res.status(404).send({ error: true, message: "Not Found" });
+        }
+
+        next();
+      } catch (error) {
+        console.error("Verify Admin Error:", error.message);
+        return res.status(404).send({ error: true, message: "Not Found" });
+      }
+    };
+
     // --- Base Route ---
     app.get('/', (req, res) => {
       res.send('KMS-FAST Server is running smoothly...');
@@ -116,7 +138,7 @@ async function run() {
     // USERS & ROLES MANAGEMENT APIS
     // ==========================================
 
-    // --- 1. Save or Update User on Login/Signup (Preserves Dynamic Roles) ---
+    // --- 1. Save or Update User on Login/Signup ---
     app.post('/users', async (req, res) => {
       try {
         const userInfo = req.body;
@@ -126,7 +148,7 @@ async function run() {
           return res.status(400).send({ error: "User email is required." });
         }
 
-        const isSuperAdmin = email === "salauddinmahi2002@gmail.com";
+        const isSuperAdmin = email === SUPER_ADMIN_EMAIL;
 
         const updateDoc = {
           $set: {
@@ -154,20 +176,21 @@ async function run() {
       }
     });
 
-    // --- 2. Get User Role by Email (Never blocks or throws 401/403) ---
+    // --- 2. Get User Role by Email ---
     app.get('/users/role/:email', verifyToken, async (req, res) => {
       try {
-        const email = req.params.email?.toLowerCase().trim();
+        const requestedEmail = req.params.email?.toLowerCase().trim();
+        const tokenEmail = req.decoded?.email?.toLowerCase().trim();
 
-        if (!email) {
-          return res.send({ role: 'user' });
+        if (!requestedEmail || requestedEmail !== tokenEmail) {
+          return res.status(404).send({ error: true, message: "Not Found" });
         }
 
-        if (email === "salauddinmahi2002@gmail.com") {
+        if (requestedEmail === SUPER_ADMIN_EMAIL) {
           return res.send({ role: "admin" });
         }
 
-        const user = await userCollection.findOne({ email });
+        const user = await userCollection.findOne({ email: requestedEmail });
         res.send({ role: user?.role || 'user' });
       } catch (error) {
         console.error("Error fetching user role:", error);
@@ -175,18 +198,9 @@ async function run() {
       }
     });
 
-    // --- 3. GET All Users (Non-blocking with flexible token support) ---
-    app.get('/users', verifyToken, async (req, res) => {
+    // --- 3. GET All Users (Admin Only) ---
+    app.get('/users', verifyToken, verifyAdmin, async (req, res) => {
       try {
-        const requesterEmail = req.decoded?.email?.toLowerCase().trim();
-
-        if (requesterEmail && requesterEmail !== "salauddinmahi2002@gmail.com") {
-          const requester = await userCollection.findOne({ email: requesterEmail });
-          if (requester?.role !== 'admin') {
-            return res.status(403).send({ error: true, message: "Forbidden access: Admin only." });
-          }
-        }
-
         const result = await userCollection.find().sort({ createdAt: -1 }).toArray();
         res.send(result);
       } catch (error) {
@@ -196,18 +210,10 @@ async function run() {
     });
 
     // --- 4. UPDATE User Role (Promote / Demote Admin) ---
-    app.patch('/users/admin/:id', verifyToken, async (req, res) => {
+    app.patch('/users/admin/:id', verifyToken, verifyAdmin, async (req, res) => {
       try {
         const { id } = req.params;
         const { role } = req.body;
-        const requesterEmail = req.decoded?.email?.toLowerCase().trim();
-
-        if (requesterEmail && requesterEmail !== "salauddinmahi2002@gmail.com") {
-          const requester = await userCollection.findOne({ email: requesterEmail });
-          if (requester?.role !== 'admin') {
-            return res.status(403).send({ error: "Forbidden access: Admin only." });
-          }
-        }
 
         if (!isValidObjectId(id)) {
           return res.status(400).send({ error: "Invalid user ID." });
@@ -222,7 +228,7 @@ async function run() {
           return res.status(404).send({ error: "User not found." });
         }
 
-        if (targetUser.email?.toLowerCase().trim() === "salauddinmahi2002@gmail.com" && role !== 'admin') {
+        if (targetUser.email?.toLowerCase().trim() === SUPER_ADMIN_EMAIL && role !== 'admin') {
           return res.status(403).send({ error: "Cannot remove admin role from Super Admin." });
         }
 
@@ -246,19 +252,21 @@ async function run() {
     // PARCELS & PAYMENTS APIS
     // ==========================================
 
-    // --- GET User Parcels (Filtered by senderEmail) ---
+    // --- GET User Parcels (Strictly scoped to logged-in user) ---
     app.get('/parcels', verifyToken, async (req, res) => {
       try {
-        const email = req.query.email;
-        let query = {};
+        const tokenEmail = req.decoded?.email?.toLowerCase().trim();
+        const queryEmail = req.query.email?.toLowerCase().trim();
 
-        if (email) {
-          query = { senderEmail: email };
-        } else if (req.decoded && req.decoded.email) {
-          query = { senderEmail: req.decoded.email };
+        if (queryEmail && queryEmail !== tokenEmail) {
+          return res.status(404).send({ error: true, message: "Not Found" });
         }
 
-        const result = await parcelCollection.find(query).sort({ createdAt: -1, creation_date: -1 }).toArray();
+        const result = await parcelCollection
+          .find({ senderEmail: tokenEmail })
+          .sort({ createdAt: -1, creation_date: -1 })
+          .toArray();
+
         res.send(result);
       } catch (error) {
         console.error('Error fetching parcels:', error);
@@ -266,18 +274,9 @@ async function run() {
       }
     });
 
-    // --- NEW: GET ALL Parcels for Admin Dashboard ---
-    app.get('/parcels/admin/all', verifyToken, async (req, res) => {
+    // --- GET ALL Parcels for Admin Dashboard ---
+    app.get('/parcels/admin/all', verifyToken, verifyAdmin, async (req, res) => {
       try {
-        const requesterEmail = req.decoded?.email?.toLowerCase().trim();
-
-        if (requesterEmail && requesterEmail !== "salauddinmahi2002@gmail.com") {
-          const requester = await userCollection.findOne({ email: requesterEmail });
-          if (requester?.role !== 'admin') {
-            return res.status(403).send({ error: true, message: "Forbidden access: Admin only." });
-          }
-        }
-
         const result = await parcelCollection
           .find({})
           .sort({ createdAt: -1, creation_date: -1 })
@@ -290,19 +289,11 @@ async function run() {
       }
     });
 
-    // --- NEW: UPDATE Parcel Delivery Status (Admin Action) ---
-    app.patch('/parcels/status/:id', verifyToken, async (req, res) => {
+    // --- UPDATE Parcel Delivery Status (Admin Action) ---
+    app.patch('/parcels/status/:id', verifyToken, verifyAdmin, async (req, res) => {
       try {
         const { id } = req.params;
         const { status } = req.body;
-        const requesterEmail = req.decoded?.email?.toLowerCase().trim();
-
-        if (requesterEmail && requesterEmail !== "salauddinmahi2002@gmail.com") {
-          const requester = await userCollection.findOne({ email: requesterEmail });
-          if (requester?.role !== 'admin') {
-            return res.status(403).send({ error: "Forbidden access: Admin only." });
-          }
-        }
 
         if (!isValidObjectId(id)) {
           return res.status(400).send({ error: "Invalid parcel ID." });
@@ -340,9 +331,9 @@ async function run() {
         const parcelItem = req.body;
         const newParcel = {
           ...parcelItem,
-          senderEmail: parcelItem.senderEmail || (req.decoded ? req.decoded.email : ''),
-          paymentStatus: parcelItem.paymentStatus || "unpaid",
-          status: parcelItem.status || "pending",
+          senderEmail: req.decoded.email.toLowerCase().trim(),
+          paymentStatus: "unpaid",
+          status: "pending",
           createdAt: new Date()
         };
 
@@ -356,22 +347,25 @@ async function run() {
       }
     });
 
-    // --- DELETE Parcel by ID ---
+    // --- DELETE Parcel by ID (Owner check enforced) ---
     app.delete('/parcels/:id', verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
+        const tokenEmail = req.decoded?.email?.toLowerCase().trim();
 
-        let query;
-        try {
-          query = { _id: new ObjectId(id) };
-        } catch (e) {
-          query = { _id: id };
+        if (!isValidObjectId(id)) {
+          return res.status(400).send({ error: true, message: "Invalid parcel ID." });
         }
 
+        const query = { _id: new ObjectId(id) };
         const parcel = await parcelCollection.findOne(query);
 
         if (!parcel) {
           return res.status(404).send({ error: true, message: "Parcel not found." });
+        }
+
+        if (parcel.senderEmail?.toLowerCase().trim() !== tokenEmail) {
+          return res.status(404).send({ error: true, message: "Not Found" });
         }
 
         if (parcel.paymentStatus === "paid") {
@@ -522,6 +516,7 @@ async function run() {
         const paymentData = req.body;
         const newPayment = {
           ...paymentData,
+          customerEmail: req.decoded.email.toLowerCase().trim(),
           amount: parseFloat(paymentData.amount) || 0,
           paidAt: new Date()
         };
@@ -535,20 +530,18 @@ async function run() {
           throw insertError;
         }
 
-        let query;
-        try {
-          query = { _id: new ObjectId(paymentData.parcelId) };
-        } catch (e) {
-          query = { _id: paymentData.parcelId };
+        if (isValidObjectId(paymentData.parcelId)) {
+          await parcelCollection.updateOne(
+            { _id: new ObjectId(paymentData.parcelId) },
+            {
+              $set: {
+                paymentStatus: 'paid',
+                transactionId: paymentData.transactionId,
+                paidAt: new Date()
+              }
+            }
+          );
         }
-
-        await parcelCollection.updateOne(query, {
-          $set: {
-            paymentStatus: 'paid',
-            transactionId: paymentData.transactionId,
-            paidAt: new Date()
-          }
-        });
 
         res.status(201).send({ success: true, message: "Payment recorded successfully." });
       } catch (error) {
@@ -557,19 +550,21 @@ async function run() {
       }
     });
 
-    // --- GET PAYMENT HISTORY ---
+    // --- GET PAYMENT HISTORY (Strictly scoped to logged-in user) ---
     app.get('/payments', verifyToken, async (req, res) => {
       try {
-        const email = req.query.email;
-        let query = {};
+        const tokenEmail = req.decoded?.email?.toLowerCase().trim();
+        const queryEmail = req.query.email?.toLowerCase().trim();
 
-        if (email) {
-          query = { customerEmail: email };
-        } else if (req.decoded && req.decoded.email) {
-          query = { customerEmail: req.decoded.email };
+        if (queryEmail && queryEmail !== tokenEmail) {
+          return res.status(404).send({ error: true, message: "Not Found" });
         }
 
-        const result = await paymentCollection.find(query, { sort: { paidAt: -1 } }).toArray();
+        const result = await paymentCollection
+          .find({ customerEmail: tokenEmail })
+          .sort({ paidAt: -1 })
+          .toArray();
+
         res.send(result);
       } catch (error) {
         console.error('Error fetching payment history:', error);
@@ -585,11 +580,7 @@ async function run() {
     app.post('/riders', verifyToken, async (req, res) => {
       try {
         const riderData = req.body;
-        const email = riderData.email;
-
-        if (!email) {
-          return res.status(400).send({ error: "Rider email is required." });
-        }
+        const email = req.decoded.email.toLowerCase().trim();
 
         const existingRider = await riderCollection.findOne({ email });
         if (existingRider) {
@@ -598,6 +589,7 @@ async function run() {
 
         const newRider = {
           ...riderData,
+          email,
           status: 'pending',
           appliedAt: new Date()
         };
@@ -610,14 +602,11 @@ async function run() {
       }
     });
 
-    // --- 2. GET All Riders ---
-    app.get('/riders', verifyToken, async (req, res) => {
+    // --- 2. GET All Riders (Admin Only) ---
+    app.get('/riders', verifyToken, verifyAdmin, async (req, res) => {
       try {
         const status = req.query.status;
-        let query = {};
-        if (status) {
-          query.status = status;
-        }
+        const query = status ? { status } : {};
         const result = await riderCollection.find(query).sort({ appliedAt: -1 }).toArray();
         res.send(result);
       } catch (error) {
@@ -626,8 +615,8 @@ async function run() {
       }
     });
 
-    // --- 3. UPDATE Rider Status (Approve / Reject) ---
-    app.patch('/riders/status/:id', verifyToken, async (req, res) => {
+    // --- 3. UPDATE Rider Status (Approve / Reject - Admin Only) ---
+    app.patch('/riders/status/:id', verifyToken, verifyAdmin, async (req, res) => {
       try {
         const { id } = req.params;
         const { status } = req.body;
@@ -644,7 +633,7 @@ async function run() {
         if (status === 'approved') {
           const rider = await riderCollection.findOne({ _id: new ObjectId(id) });
           if (rider?.email) {
-            await userCollection.updateOne({ email: rider.email }, { $set: { role: 'rider' } });
+            await userCollection.updateOne({ email: rider.email.toLowerCase().trim() }, { $set: { role: 'rider' } });
           }
         }
 
@@ -655,13 +644,13 @@ async function run() {
       }
     });
 
+    // --- Start Server After DB Connection ---
+    app.listen(port, () => {
+      console.log(`Server is running on port: ${port}`);
+    });
+
   } catch (error) {
     console.error('Failed to connect to MongoDB:', error);
   }
 }
 run().catch(console.dir);
-
-// --- Start Server ---
-app.listen(port, () => {
-  console.log(`Server is running on port: ${port}`);
-});
